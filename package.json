@@ -1,0 +1,27 @@
+{
+  "name": "ws-event-emitter",
+  "version": "0.0.1",
+  "description": "Provides a event emitter linked between clients and server using web socket (includes permission handeling)",
+  "main": "build/index.js",
+  "scripts": {
+    "demo": "node demo.js",
+    "test": "echo \"No tests specified\" && exit 0"
+  },
+  "keywords": [
+    "ws",
+    "node-events",
+    "events",
+    "websocket"
+  ],
+  "author": "Unluchymichell",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^16.11.6",
+    "@types/ws": "^8.2.0",
+    "typescript": "^4.4.4"
+  },
+  "dependencies": {
+    "events": "^3.3.0",
+    "ws": "^8.2.3"
+  }
+}

@@ -1,0 +1,16 @@
+{
+    "compilerOptions": {
+        "allowSyntheticDefaultImports": true,
+        "lib": ["ES2020", "DOM"],
+        "module": "CommonJS",
+        "moduleResolution": "Node",
+        "target": "ES2019",
+        "rootDir": "src",
+        "outDir": "build",
+        "strict": true,
+        "sourceMap": true,
+        "esModuleInterop": true,
+        "declaration": true
+    },
+    "exclude": ["./node_modules/**/*", "./build"]
+}
