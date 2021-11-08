@@ -1,6 +1,6 @@
 {
   "name": "ws-event-emitter",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "description": "Provides a event emitter linked between clients and server using web socket (includes permission handeling)",
   "main": "build/index.js",
   "scripts": {
