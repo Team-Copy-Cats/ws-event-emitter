@@ -4,7 +4,8 @@
   "description": "Provides a event emitter linked between clients and server using web socket (includes permission handeling)",
   "main": "build/index.js",
   "scripts": {
-    "demo": "node demo.js",
+    "demoClient": "node demoClient.js",
+    "demoServer": "node demoServer.js",
     "test": "echo \"No tests specified\" && exit 0"
   },
   "keywords": [
