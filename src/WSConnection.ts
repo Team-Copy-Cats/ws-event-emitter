@@ -1,7 +1,8 @@
 import {IncomingMessage} from "http";
 import {WebSocket} from "ws";
 import {EventEmitter} from "events";
-import {JSONTypes, WSEventMessage} from "./index";
+import {JSONTypes, WSEventMessage, WSEventMessageBase, WSEventMessageEvent} from "./index";
+import {StatusError} from "./WSHandler";
 
 /** ### WSConnection class
  * This class represents a connection.\
@@ -17,6 +18,14 @@ import {JSONTypes, WSEventMessage} from "./index";
  * @param req The IncomingMessage of the http server for headers and other http related functions
  */
 export interface WSConnection<conParaT> {
+  /** ### Error Event
+   * This event will fire if a error is recieved or something went wrong localy.
+   * @param eventName
+   * @param listener
+   */
+  on(eventName: "error", listener: (error: StatusError | Error | string, source?: unknown) => void): this;
+  emit(eventName: "error", error: StatusError | Error | string, source?: unknown): boolean;
+
   /** ### Message Event
    * This event will fire if a WSEventMessage is recieved from this client.
    * It will fire without any permission checks as they are done in a WSHandler!
@@ -26,6 +35,16 @@ export interface WSConnection<conParaT> {
    */
   on(eventName: "message", listener: (message: WSEventMessage) => void): this;
   emit(eventName: "message", message: WSEventMessage): boolean;
+
+  /** ### Event Event
+     * This event will fire if a atual event (WSEventMessageEvent) is recieved from this client.
+     * It will fire without any permission checks as they are done in a WSHandler!
+     * You should not use this event if you need the EventDistibutionFilter to work!
+     * @param eventName
+     * @param listener
+     */
+  on(eventName: "event", listener: (message: WSEventMessageEvent) => void): this;
+  emit(eventName: "event", message: WSEventMessageEvent): boolean;
 
   /** ### Close Event
    * This event will fire if a connection is closed.
@@ -76,8 +95,8 @@ export class WSConnection<conParaT> extends EventEmitter {
 
   private reconnect(func: () => WebSocket) {
     var reconnectHandler = () => {
-      if(this.closedClean) return;
-      console.warn("[WSConnection] WS lost connection, reconnecting in 5s...")
+      if (this.closedClean) return;
+      console.warn("[WSConnection] WS lost connection, reconnecting in 5s...");
       this.closed = true;
       this.emit("close_reconnect");
       this.autoReconnectTimeout = setTimeout(() => {
@@ -86,11 +105,13 @@ export class WSConnection<conParaT> extends EventEmitter {
     };
     try {
       this.ws = func()
-        .on("open", () => this.closed = false)
-        .on("error", () => {})
+        .on("open", () => {
+          this.closed = false;
+          if(this.ws) this.ws.on("error", (err) => this.emit("error", err, this.ws));
+        })
         .on("close", reconnectHandler)
         .on("message", this.onRawMessage.bind(this));
-    } catch(err) {
+    } catch (err) {
       reconnectHandler();
     }
   }
@@ -110,6 +131,7 @@ export class WSConnection<conParaT> extends EventEmitter {
     (eventEmitter as any)._WSHandler_originalEmit = emit;
     eventEmitter.emit = (eventName: string, ...args: JSONTypes[]) => {
       this.send({
+        type: "event",
         event: eventName,
         args: args,
       });
@@ -123,6 +145,7 @@ export class WSConnection<conParaT> extends EventEmitter {
     if (typeof (eventEmitter as any)._WSHandler_originalEmit != "object") throw new Error("Emitter is not bound. Cannot unbind");
     eventEmitter.emit = (eventEmitter as any)._WSHandler_originalEmit as (eventName: string | symbol, ...args: any[]) => boolean;
     (eventEmitter as any)._WSHandler_originalEmit = undefined;
+    this.localEmitters = this.localEmitters.filter((e) => e != eventEmitter);
     return eventEmitter;
   }
 
@@ -138,17 +161,33 @@ export class WSConnection<conParaT> extends EventEmitter {
       if (data === null) return; // TODO: Send ERROR
       if (typeof data != "object") return; // TODO: Send ERROR
       if (Array.isArray(data)) return; // TODO: Send ERROR
-      if (typeof data.event != "string") return; // TODO: Send ERROR
-      if (typeof data.args != "object") return; // TODO: Send ERROR
-      if (!Array.isArray(data.args)) return; // TODO: Send ERROR
-      this.onMessage(data as WSEventMessage);
+      if (typeof data.type != "string") return; // TODO: Send ERROR
+      this.onParsedMessage(data as WSEventMessageBase);
     }
   }
 
   /** Internal message handler */
-  private onMessage(message: WSEventMessage) {
-    this.localEmitters.forEach(e => (e as any)._WSHandler_originalEmit(message.event, ...message.args));
-    this.emit("message", message);
+  private onParsedMessage(message: WSEventMessageBase) {
+    switch (message.type) {
+      case "event":
+        if (typeof message.event != "string") return; 
+        if (typeof message.args != "object") return;
+        if (!Array.isArray(message.args)) return;
+        var event = message as WSEventMessageEvent;
+        this.emit("event", event);
+        this.localEmitters.forEach(e => (e as any)._WSHandler_originalEmit(event.event, ...event.args));
+        break;
+
+      case "error":
+        if (typeof message.code != "number") return; 
+        if (typeof message.message != "string") return;
+        this.emit("error", new StatusError(message.code, message.message));
+        break;
+
+      default:
+        this.emit("error", new Error("Unknown message type: " + message.type));
+        break;
+    }
   }
 
   /** Send a WSEventMessage to this connection */
@@ -163,7 +202,7 @@ export class WSConnection<conParaT> extends EventEmitter {
   public close() {
     this.closed = true;
     this.closedClean = true;
-    if(this.ws) this.ws.close();
+    if (this.ws) this.ws.close();
     this.emit("close");
     this.ws = null;
   }

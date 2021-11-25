@@ -4,7 +4,8 @@ import {normalize} from "path";
 import {Server as WebSocketServer, WebSocket} from "ws";
 import {EventEmitter} from "events";
 import {WSConnection} from "./WSConnection";
-import {ConnectionFilter, EventDistibutionFilter, JSONTypes, WSEventMessage} from "./index";
+import {ConnectionFilter, EventDistibutionFilter, JSONTypes, WSEventMessageEvent} from "./index";
+import {WS_ERRORS} from "./WSErrors";
 
 /**
  * Contains a WS Server and can be bound to a http server
@@ -14,7 +15,7 @@ export class WSHandler<conParaT = unknown> extends WebSocketServer {
   /** Will store the last instance created */
   public static instance: WebSocketServer;
 
-  localEmitters: EventEmitter[] = [];
+  localEmitters: (EventEmitter & {_originalEmit: any})[] = [];
   connections: WSConnection<conParaT>[] = [];
   connectionFilter: ConnectionFilter<conParaT>[] = [];
   eventDistibutionFilter: EventDistibutionFilter<conParaT>[] = [];
@@ -26,7 +27,7 @@ export class WSHandler<conParaT = unknown> extends WebSocketServer {
   /**
    * Returns a new Event Emitter that is bound to this Handler
    */
-  createLocalEmitter(): EventEmitter {
+  createLocalEmitter(): EventEmitter & {_originalEmit: any} {
     return this.bindLocalEmitter(new EventEmitter({captureRejections: true}));
   }
 
@@ -34,25 +35,26 @@ export class WSHandler<conParaT = unknown> extends WebSocketServer {
    * Binds a existing Event Emitter to this Handler\
    * !!! Will modify the emit method of the emitter !!!
    */
-  bindLocalEmitter(eventEmitter: EventEmitter): EventEmitter {
-    if(typeof (eventEmitter as any)._WSHandler_originalEmit == "object") throw new Error("Emitter is bound. Cannot bind again")
+  bindLocalEmitter<ev extends EventEmitter>(eventEmitter: ev): ev & {_originalEmit: any} {
+    if (typeof (eventEmitter as ev & {_originalEmit: any})._originalEmit == "object") throw new Error("Emitter is bound. Cannot bind again");
     var emit = eventEmitter.emit.bind(eventEmitter);
-    (eventEmitter as any)._WSHandler_originalEmit = emit;
+    (eventEmitter as ev & {_originalEmit: any})._originalEmit = emit;
     eventEmitter.emit = (eventName: string, ...args: JSONTypes[]) => {
-      this.distributeMessage(eventEmitter, {event: eventName, args});
+      this.distributeEventPartA(eventEmitter, {type: "event", event: eventName, args});
       return emit(eventName, ...args);
     };
-    this.localEmitters.push(eventEmitter);
-    return eventEmitter;
+    this.localEmitters.push(eventEmitter as any);
+    return eventEmitter as ev & {_originalEmit: any};
   }
 
   /**
    * Will remove Event Emitter from this handler and repair the emit method
    */
-  unbindLocalEmitter(eventEmitter: EventEmitter): EventEmitter {
-    if(typeof (eventEmitter as any)._WSHandler_originalEmit != "object") throw new Error("Emitter is not bound. Cannot unbind")
-    eventEmitter.emit = (eventEmitter as any)._WSHandler_originalEmit as (eventName: string | symbol, ...args: any[]) => boolean;
-    (eventEmitter as any)._WSHandler_originalEmit = undefined;
+  unbindLocalEmitter<ev extends EventEmitter>(eventEmitter: ev & {_originalEmit: any}): ev {
+    if (typeof (eventEmitter as any)._originalEmit != "object") throw new Error("Emitter is not bound. Cannot unbind");
+    eventEmitter.emit = (eventEmitter as any)._originalEmit as (eventName: string | symbol, ...args: any[]) => boolean;
+    (eventEmitter as any)._originalEmit = undefined;
+    this.localEmitters = this.localEmitters.filter(e => e !== eventEmitter);
     return eventEmitter;
   }
 
@@ -64,7 +66,7 @@ export class WSHandler<conParaT = unknown> extends WebSocketServer {
     WSHandler.instance = this;
     this.on("connection", this.onConnection.bind(this));
 
-    if(process) {
+    if (process) {
       process.on("exit", () => {
         this.connections.forEach(con => con.close());
       });
@@ -73,36 +75,89 @@ export class WSHandler<conParaT = unknown> extends WebSocketServer {
 
   private onConnection(ws: WebSocket, req: IncomingMessage) {
     var con = new WSConnection<conParaT>(ws, req);
-    var results = this.connectionFilter.map(filter => filter(con, req));
-    var ret = results.find(res => !!res);
-    if (ret instanceof StatusError) return ws.close(); // TODO: Do something different with StatusError. WS Error codes are fixed and stupidly documented! See: https://github.com/websockets/ws/blob/HEAD/doc/ws.md#ws-error-codes
-    con.on("close", this.cleanUpConList.bind(this));
-    con.on("message", message => this.distributeMessage(con, message));
-    this.connections.push(con);
+    var filterResult = Promise.all(this.connectionFilter.map(filter => filter(con, req)));
+
+    // Error Condition
+    filterResult.catch(err => {
+      if (err instanceof StatusError) con.send({type: "error", code: err.code, message: err.message});
+      else con.send({type: "error", ...WS_ERRORS.CONNECTION_REFUSED});
+      con.close();
+    });
+    filterResult.then(res => {
+      if (res.some(r => r instanceof StatusError)) {
+        var statusError = res.find(r => r instanceof StatusError) as StatusError;
+        con.send({type: "error", code: statusError.code, message: statusError.message});
+        con.close();
+      } else if (res.some(r => !!r)) {
+        con.send({type: "error", ...WS_ERRORS.CONNECTION_REFUSED});
+        con.close();
+      } else {
+        // Sucessful connection
+        con.on("close", this.cleanUpConList.bind(this));
+        con.on("event", message => this.distributeEventPartA(con, message));
+        this.connections.push(con);
+      }
+    });
   }
 
-  /**
-   * Distribute a event in the system by using  added filters
-   * @param sender
-   * @param message
-   * @returns True if event was not dropped
+  /** Internal method!
+   * Distribute a event in the system part A
+   * => Check if the event is permitted to be send
+   * @param sender The sender of the event
+   * @param message The event message
    */
-  private distributeMessage(sender: WSConnection<conParaT> | EventEmitter, message: WSEventMessage): boolean {
-    if (
-      sender instanceof WSConnection &&
-      this.eventDistibutionFilter.some(filter => !filter(sender, sender.req as IncomingMessage, "send", message.event, ...message.args))
-    )
-      return false; // Silently filter event out if sender is not permitted to send event (LocalEventEmitter is allways permitted)
-
-    // Emit (without backloop) event to each local emitter if it was not send by this one
-    this.localEmitters.forEach(e => e !== sender && (e as any)._WSHandler_originalEmit(message.event, ...message.args));
+  private distributeEventPartA(sender: WSConnection<conParaT> | EventEmitter, message: WSEventMessageEvent) {
+    if (sender instanceof WSConnection) {
+      // If sender is Remote, first check asyncronosly if sender is allowed to send
+      this.runEventDistributionFilters("send", sender, message.event, message.args, () => this.distributeEventPartB(sender, message));
+    } else {
+      // If sender is local, jump to Part B instantly
+      this.distributeEventPartB(sender, message);
+    }
+  }
+  /** Internal method!
+   * Distribute a event in the system part B
+   * => Filter out all connections that are allowed to recive the event
+   * @param sender The sender of the event
+   * @param message The event message
+   */
+  private distributeEventPartB(sender: WSConnection<conParaT> | EventEmitter, message: WSEventMessageEvent) {
+    // Emit (without backloop) event to each local emitter if it was not the sender
+    this.localEmitters.forEach(e => e !== sender && (e as any)._originalEmit(message.event, ...message.args));
 
     // Send event to each connection that is permitted to recieve event
     for (const con of this.connections)
-      if (!this.eventDistibutionFilter.some(filter => !filter(con, con.req as IncomingMessage, "recive", message.event, ...message.args)))
+      this.runEventDistributionFilters("recive", con, message.event, message.args, () => {
         con.send(message);
+      });
+  }
 
-    return true;
+  /** Internal method!
+   * Chains a list of filters and runs them in order
+   * @param direction "send" or "recive" from remote perspective (remote is sending / reciving)
+   * @param connection The Connection that is sending or reciving
+   * @param eventName The event that is being sent or recived
+   * @param eventArgs The arguments of the event
+   * @param allowedCallback Callback that is called if the event is allowed by all filters
+   * @param i Should not be set manually! Recursive counter
+   */
+  private runEventDistributionFilters(
+    direction: "send" | "recive",
+    connection: WSConnection<conParaT>,
+    eventName: string,
+    eventArgs: JSONTypes[],
+    allowedCallback: () => void,
+    i = 0
+  ) {
+    if (this.eventDistibutionFilter.length <= i) allowedCallback();
+    else
+      this.eventDistibutionFilter[i](
+        () => this.runEventDistributionFilters(direction, connection, eventName, eventArgs, allowedCallback, i + 1),
+        direction,
+        connection,
+        eventName,
+        ...eventArgs
+      );
   }
 
   /** Internal method!
@@ -151,9 +206,9 @@ export class WSHandler<conParaT = unknown> extends WebSocketServer {
 /** A Status error includes a status number and can be used as a statusCode in http protocol */
 export class StatusError extends Error {
   name = "StatusError";
-  status: number;
-  constructor(status: number, message: string) {
+  code: number;
+  constructor(public status: number, message: string) {
     super(`${status} - ${message}`);
-    this.status = status;
+    this.code = status;
   }
 }

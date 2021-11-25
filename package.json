@@ -6,6 +6,8 @@
   "scripts": {
     "demoClient": "node demoClient.js",
     "demoServer": "node demoServer.js",
+    "build": "tsc",
+    "buildWatch": "tsc -w",
     "test": "echo \"No tests specified\" && exit 0"
   },
   "keywords": [
