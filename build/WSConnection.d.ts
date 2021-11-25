@@ -2,7 +2,8 @@
 import { IncomingMessage } from "http";
 import { WebSocket } from "ws";
 import { EventEmitter } from "events";
-import { WSEventMessage } from "./index";
+import { WSEventMessage, WSEventMessageEvent } from "./index";
+import { StatusError } from "./WSHandler";
 /** ### WSConnection class
  * This class represents a connection.\
  * The conPara represents a Custom Parameter. You can assign connection specific data
@@ -17,6 +18,13 @@ import { WSEventMessage } from "./index";
  * @param req The IncomingMessage of the http server for headers and other http related functions
  */
 export interface WSConnection<conParaT> {
+    /** ### Error Event
+     * This event will fire if a error is recieved or something went wrong localy.
+     * @param eventName
+     * @param listener
+     */
+    on(eventName: "error", listener: (error: StatusError | Error | string, source?: unknown) => void): this;
+    emit(eventName: "error", error: StatusError | Error | string, source?: unknown): boolean;
     /** ### Message Event
      * This event will fire if a WSEventMessage is recieved from this client.
      * It will fire without any permission checks as they are done in a WSHandler!
@@ -26,6 +34,15 @@ export interface WSConnection<conParaT> {
      */
     on(eventName: "message", listener: (message: WSEventMessage) => void): this;
     emit(eventName: "message", message: WSEventMessage): boolean;
+    /** ### Event Event
+       * This event will fire if a atual event (WSEventMessageEvent) is recieved from this client.
+       * It will fire without any permission checks as they are done in a WSHandler!
+       * You should not use this event if you need the EventDistibutionFilter to work!
+       * @param eventName
+       * @param listener
+       */
+    on(eventName: "event", listener: (message: WSEventMessageEvent) => void): this;
+    emit(eventName: "event", message: WSEventMessageEvent): boolean;
     /** ### Close Event
      * This event will fire if a connection is closed.
      * Code and Message is taken from the ws module. See docs for more Info
@@ -69,7 +86,7 @@ export declare class WSConnection<conParaT> extends EventEmitter {
     /** Internal ws.message handler */
     private onRawMessage;
     /** Internal message handler */
-    private onMessage;
+    private onParsedMessage;
     /** Send a WSEventMessage to this connection */
     send(message: WSEventMessage): void;
     /** Close this connection */

@@ -5,6 +5,7 @@ const path_1 = require("path");
 const ws_1 = require("ws");
 const events_1 = require("events");
 const WSConnection_1 = require("./WSConnection");
+const WSErrors_1 = require("./WSErrors");
 /**
  * Contains a WS Server and can be bound to a http server
  * Will handel event communication between clients and server
@@ -41,12 +42,12 @@ class WSHandler extends ws_1.Server {
      * !!! Will modify the emit method of the emitter !!!
      */
     bindLocalEmitter(eventEmitter) {
-        if (typeof eventEmitter._WSHandler_originalEmit == "object")
+        if (typeof eventEmitter._originalEmit == "object")
             throw new Error("Emitter is bound. Cannot bind again");
         var emit = eventEmitter.emit.bind(eventEmitter);
-        eventEmitter._WSHandler_originalEmit = emit;
+        eventEmitter._originalEmit = emit;
         eventEmitter.emit = (eventName, ...args) => {
-            this.distributeMessage(eventEmitter, { event: eventName, args });
+            this.distributeEventPartA(eventEmitter, { type: "event", event: eventName, args });
             return emit(eventName, ...args);
         };
         this.localEmitters.push(eventEmitter);
@@ -56,39 +57,87 @@ class WSHandler extends ws_1.Server {
      * Will remove Event Emitter from this handler and repair the emit method
      */
     unbindLocalEmitter(eventEmitter) {
-        if (typeof eventEmitter._WSHandler_originalEmit != "object")
+        if (typeof eventEmitter._originalEmit != "object")
             throw new Error("Emitter is not bound. Cannot unbind");
-        eventEmitter.emit = eventEmitter._WSHandler_originalEmit;
-        eventEmitter._WSHandler_originalEmit = undefined;
+        eventEmitter.emit = eventEmitter._originalEmit;
+        eventEmitter._originalEmit = undefined;
+        this.localEmitters = this.localEmitters.filter(e => e !== eventEmitter);
         return eventEmitter;
     }
     onConnection(ws, req) {
         var con = new WSConnection_1.WSConnection(ws, req);
-        var results = this.connectionFilter.map(filter => filter(con, req));
-        var ret = results.find(res => !!res);
-        if (ret instanceof StatusError)
-            return ws.close(); // TODO: Do something different with StatusError. WS Error codes are fixed and stupidly documented! See: https://github.com/websockets/ws/blob/HEAD/doc/ws.md#ws-error-codes
-        con.on("close", this.cleanUpConList.bind(this));
-        con.on("message", message => this.distributeMessage(con, message));
-        this.connections.push(con);
+        var filterResult = Promise.all(this.connectionFilter.map(filter => filter(con, req)));
+        // Error Condition
+        filterResult.catch(err => {
+            if (err instanceof StatusError)
+                con.send({ type: "error", code: err.code, message: err.message });
+            else
+                con.send({ type: "error", ...WSErrors_1.WS_ERRORS.CONNECTION_REFUSED });
+            con.close();
+        });
+        filterResult.then(res => {
+            if (res.some(r => r instanceof StatusError)) {
+                var statusError = res.find(r => r instanceof StatusError);
+                con.send({ type: "error", code: statusError.code, message: statusError.message });
+                con.close();
+            }
+            else if (res.some(r => !!r)) {
+                con.send({ type: "error", ...WSErrors_1.WS_ERRORS.CONNECTION_REFUSED });
+                con.close();
+            }
+            else {
+                // Sucessful connection
+                con.on("close", this.cleanUpConList.bind(this));
+                con.on("event", message => this.distributeEventPartA(con, message));
+                this.connections.push(con);
+            }
+        });
     }
-    /**
-     * Distribute a event in the system by using  added filters
-     * @param sender
-     * @param message
-     * @returns True if event was not dropped
+    /** Internal method!
+     * Distribute a event in the system part A
+     * => Check if the event is permitted to be send
+     * @param sender The sender of the event
+     * @param message The event message
      */
-    distributeMessage(sender, message) {
-        if (sender instanceof WSConnection_1.WSConnection &&
-            this.eventDistibutionFilter.some(filter => !filter(sender, sender.req, "send", message.event, ...message.args)))
-            return false; // Silently filter event out if sender is not permitted to send event (LocalEventEmitter is allways permitted)
-        // Emit (without backloop) event to each local emitter if it was not send by this one
-        this.localEmitters.forEach(e => e !== sender && e._WSHandler_originalEmit(message.event, ...message.args));
+    distributeEventPartA(sender, message) {
+        if (sender instanceof WSConnection_1.WSConnection) {
+            // If sender is Remote, first check asyncronosly if sender is allowed to send
+            this.runEventDistributionFilters("send", sender, message.event, message.args, () => this.distributeEventPartB(sender, message));
+        }
+        else {
+            // If sender is local, jump to Part B instantly
+            this.distributeEventPartB(sender, message);
+        }
+    }
+    /** Internal method!
+     * Distribute a event in the system part B
+     * => Filter out all connections that are allowed to recive the event
+     * @param sender The sender of the event
+     * @param message The event message
+     */
+    distributeEventPartB(sender, message) {
+        // Emit (without backloop) event to each local emitter if it was not the sender
+        this.localEmitters.forEach(e => e !== sender && e._originalEmit(message.event, ...message.args));
         // Send event to each connection that is permitted to recieve event
         for (const con of this.connections)
-            if (!this.eventDistibutionFilter.some(filter => !filter(con, con.req, "recive", message.event, ...message.args)))
+            this.runEventDistributionFilters("recive", con, message.event, message.args, () => {
                 con.send(message);
-        return true;
+            });
+    }
+    /** Internal method!
+     * Chains a list of filters and runs them in order
+     * @param direction "send" or "recive" from remote perspective (remote is sending / reciving)
+     * @param connection The Connection that is sending or reciving
+     * @param eventName The event that is being sent or recived
+     * @param eventArgs The arguments of the event
+     * @param allowedCallback Callback that is called if the event is allowed by all filters
+     * @param i Should not be set manually! Recursive counter
+     */
+    runEventDistributionFilters(direction, connection, eventName, eventArgs, allowedCallback, i = 0) {
+        if (this.eventDistibutionFilter.length <= i)
+            allowedCallback();
+        else
+            this.eventDistibutionFilter[i](() => this.runEventDistributionFilters(direction, connection, eventName, eventArgs, allowedCallback, i + 1), direction, connection, eventName, ...eventArgs);
     }
     /** Internal method!
      * Remove closed connections from the connection list
@@ -137,8 +186,9 @@ exports.WSHandler = WSHandler;
 class StatusError extends Error {
     constructor(status, message) {
         super(`${status} - ${message}`);
-        this.name = "StatusError";
         this.status = status;
+        this.name = "StatusError";
+        this.code = status;
     }
 }
 exports.StatusError = StatusError;

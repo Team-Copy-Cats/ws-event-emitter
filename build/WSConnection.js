@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.WSConnection = void 0;
 const events_1 = require("events");
+const WSHandler_1 = require("./WSHandler");
 class WSConnection extends events_1.EventEmitter {
     constructor(ws, req) {
         super({ captureRejections: true });
@@ -35,8 +36,11 @@ class WSConnection extends events_1.EventEmitter {
         };
         try {
             this.ws = func()
-                .on("open", () => this.closed = false)
-                .on("error", () => { })
+                .on("open", () => {
+                this.closed = false;
+                if (this.ws)
+                    this.ws.on("error", (err) => this.emit("error", err, this.ws));
+            })
                 .on("close", reconnectHandler)
                 .on("message", this.onRawMessage.bind(this));
         }
@@ -59,6 +63,7 @@ class WSConnection extends events_1.EventEmitter {
         eventEmitter._WSHandler_originalEmit = emit;
         eventEmitter.emit = (eventName, ...args) => {
             this.send({
+                type: "event",
                 event: eventName,
                 args: args,
             });
@@ -72,6 +77,7 @@ class WSConnection extends events_1.EventEmitter {
             throw new Error("Emitter is not bound. Cannot unbind");
         eventEmitter.emit = eventEmitter._WSHandler_originalEmit;
         eventEmitter._WSHandler_originalEmit = undefined;
+        this.localEmitters = this.localEmitters.filter((e) => e != eventEmitter);
         return eventEmitter;
     }
     /** Internal ws.message handler */
@@ -92,19 +98,36 @@ class WSConnection extends events_1.EventEmitter {
                 return; // TODO: Send ERROR
             if (Array.isArray(data))
                 return; // TODO: Send ERROR
-            if (typeof data.event != "string")
+            if (typeof data.type != "string")
                 return; // TODO: Send ERROR
-            if (typeof data.args != "object")
-                return; // TODO: Send ERROR
-            if (!Array.isArray(data.args))
-                return; // TODO: Send ERROR
-            this.onMessage(data);
+            this.onParsedMessage(data);
         }
     }
     /** Internal message handler */
-    onMessage(message) {
-        this.localEmitters.forEach(e => e._WSHandler_originalEmit(message.event, ...message.args));
-        this.emit("message", message);
+    onParsedMessage(message) {
+        switch (message.type) {
+            case "event":
+                if (typeof message.event != "string")
+                    return;
+                if (typeof message.args != "object")
+                    return;
+                if (!Array.isArray(message.args))
+                    return;
+                var event = message;
+                this.emit("event", event);
+                this.localEmitters.forEach(e => e._WSHandler_originalEmit(event.event, ...event.args));
+                break;
+            case "error":
+                if (typeof message.code != "number")
+                    return;
+                if (typeof message.message != "string")
+                    return;
+                this.emit("error", new WSHandler_1.StatusError(message.code, message.message));
+                break;
+            default:
+                this.emit("error", new Error("Unknown message type: " + message.type));
+                break;
+        }
     }
     /** Send a WSEventMessage to this connection */
     send(message) {
